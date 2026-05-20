@@ -1,34 +1,52 @@
-# mpv-jellyfin
-[mpv](https://github.com/mpv-player/mpv) plugin that turns it into a [Jellyfin](https://jellyfin.org/) client
+# mpv-jellyfin usage
 
-## Features
+## Install
 
-- Minimal Jellyfin client that integrates into mpv
-- Navigate your libraries and play files
-- Some basic metadata is shown for each item
-- If an item is unwatched, it's description is hidden to prevent spoilers
-- When a video file finishes playing, it will be marked as watched
+Copy `scripts/jellyfin_client.lua` to your mpv `scripts` directory.
 
-## Installation
+Copy `script-opts/jellyfin_client.conf` to your mpv `script-opts` directory, then set `url` to your Jellyfin server address.
 
-Copy the .lua file in `scripts/` to your mpv scripts directory (See [mpv's manual](https://mpv.io/manual/master/#files)).
+Example mpv layout:
 
-## Configuration
+```text
+portable_config/
+  scripts/
+    jellyfin_client.lua
+  script-opts/
+    jellyfin_client.conf
+```
 
-Can be configured through the usual `script-opts` mechanism of mpv (see its [manual](https://mpv.io/manual/master/#files)). The file [`jellyfin.conf`](script-opts/jellyfin.conf) in this repository contains a detailed list of options.
+## First run
 
-## Usage
+Start mpv and press `Ctrl+j` to open the Jellyfin menu.
 
-By default, the Jellyfin menu can be toggled with `ctrl+j`.
+If no saved token exists, the script starts Jellyfin Quick Connect. Authorize the displayed code from another logged-in Jellyfin client. The token is saved in mpv's state directory.
 
-You can navigate around using the arrow keys.
+## Controls
 
-When you activate a video in the menu, it will begin to play that file.
+- `Ctrl+j`: open or close the Jellyfin menu
+- Native menu controls: use mpv's built-in select menu with keyboard, mouse, and search support
+- `Ctrl+f`: search, when `user-input-module` is installed
 
-## Limitations
+## Menu behavior
 
-Requires mpv v0.38.0 or greater.
+The root menu shows Jellyfin libraries and their latest items.
 
-In general this is a very minimal script and isn't designed to be a full Jellyfin client. Changing settings or metadata has to be done from a real Jellyfin client.
+Use `home_latest_limit` in `jellyfin_client.conf` to control how many latest items are shown for each library on the root menu.
 
-Thumbnails will accumulate if the selected image path isn't tmpfs. In addition thumbnails are raw bgra, which means they are less space efficient than the source images from the Jellyfin server.
+For TV libraries, latest episodes are shown as their parent series so selecting them enters the series episode list instead of playing a single returned episode directly.
+
+Media items show watch-state prefixes: `🔲` unwatched, `🔄` partially watched, and `✅` watched. Series episode lists show unfinished episodes first by newest update time, followed by watched episodes in reverse episode order.
+
+Selecting playable media starts playback in mpv and resumes from Jellyfin's saved playback position when available. When playing an episode from a series episode list, the script queues the selected episode and following playable items from that menu as an mpv playlist.
+
+During playback, the script reports progress to Jellyfin, updates progress on pause and seek, and adds external subtitles when Jellyfin exposes them.
+
+See `script-opts/jellyfin_client.conf` for all configuration options.
+
+## Requirements
+
+- mpv `0.38.0` or newer
+- mpv native menu support through `mp.input.select`
+- `curl` available in PATH
+- optional: `user-input-module` for `Ctrl+f` search
