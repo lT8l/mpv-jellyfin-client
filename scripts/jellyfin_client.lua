@@ -40,11 +40,7 @@ local state = {
     items = {},
     playback_items_by_id = {},
     playback_items_by_path = {},
-    playlist_resume_enabled = false,
-    last_playback_item = nil,
-    last_playback_item_id = "",
-    last_position_ticks = nil,
-    last_stop_key = "",
+    active_playback = nil,
     suppress_pause_report = false
 }
 
@@ -192,10 +188,6 @@ end
 
 local function get_subtitle_url(item_id, source_id, stream_index, ext)
     return api_url("/Videos/" .. item_id .. "/" .. source_id .. "/Subtitles/" .. stream_index .. "/Stream." .. ext)
-end
-
-local function ticks_query_value(ticks)
-    return string.format("%.0f", math.max(0, tonumber(ticks) or 0))
 end
 
 local function quote_header_value(value)
@@ -397,22 +389,22 @@ local function is_auth_error(info)
     return info and (info.status == 401 or info.status == 403)
 end
 
-local function send_json_request(method, url, opts)
+local function build_json_request_args(method, url, opts)
     opts = opts or {}
     local request_opts = copy_table(opts)
     request_opts.extra_args = copy_table(opts.extra_args)
     table.insert(request_opts.extra_args, "-w")
     table.insert(request_opts.extra_args, "\n%{http_code}")
+    return build_curl_args(method, url, request_opts)
+end
 
-    local start_time = mp.get_time()
-    local request = run_curl(build_curl_args(method, url, request_opts))
-    msg.debug(string.format("Waited %.3f seconds for response", mp.get_time() - start_time))
-
+local function parse_json_response(success, request, url)
     local info = { url = url, status = nil, curl_status = nil, ok = false }
-    if not request then
+    if not success or not request then
         msg.warn("Jellyfin API request failed: " .. url)
         return nil, info
     end
+
     info.curl_status = request.status
     local body, status = split_curl_http_response(request.stdout)
     info.status = status
@@ -435,9 +427,37 @@ local function send_json_request(method, url, opts)
     return parsed, info
 end
 
+local function send_json_request(method, url, opts)
+    local start_time = mp.get_time()
+    local request = run_curl(build_json_request_args(method, url, opts))
+    msg.debug(string.format("Waited %.3f seconds for response", mp.get_time() - start_time))
+    return parse_json_response(request ~= nil, request, url)
+end
+
+local function send_json_request_async(method, url, opts, callback)
+    mp.command_native_async({
+        name = "subprocess",
+        playback_only = false,
+        capture_stdout = true,
+        capture_stderr = true,
+        args = build_json_request_args(method, url, opts)
+    }, function(success, result)
+        local parsed, info = parse_json_response(success, result, url)
+        if callback then callback(parsed, info) end
+    end)
+end
+
 local function send_request(method, url)
     if state.api_key == "" then return nil end
     return send_json_request(method, url, { headers = { get_api_auth_header() } })
+end
+
+local function send_request_async(method, url, callback)
+    if state.api_key == "" then
+        callback(nil, { url = url, ok = false, auth_missing = true })
+        return
+    end
+    send_json_request_async(method, url, { headers = { get_api_auth_header() } }, callback)
 end
 
 ---------------------------------------------------------------------
@@ -631,146 +651,198 @@ local function add_ids_to_set(set, ids)
     end
 end
 
-local function fetch_root_menu()
-    local new_items = {}
-    local excluded_views = {}
+local menu_request_id = 0
 
-    local user_res, user_info = send_request("GET", user_api_url(""))
-    local excludes = {}
-    if not user_res and is_auth_error(user_info) then return nil, user_info end
-
-    if user_res and user_res.Configuration then
-        add_ids_to_set(excludes, user_res.Configuration.LatestItemsExcludes)
-        add_ids_to_set(excludes, user_res.Configuration.MyMediaExcludes)
-    end
-
-    local views_res, views_info = send_request("GET", user_api_url("/Views"))
-
-    if not views_res or not views_res.Items then return nil, views_info end
-
-    local series_cache, series_names = {}, {}
-
-    local function fetch_series_entries(series_ids)
-        local ids = {}
-        for id in pairs(series_ids) do
-            if not series_cache[id] then table.insert(ids, id) end
-        end
-        if #ids == 0 then return end
-
-        local series_res = send_request("GET", user_api_url("/Items?Ids=" .. table.concat(ids, ",") .. "&Fields=RecursiveItemCount,ChildCount"))
-        if series_res and type(series_res.Items) == "table" then
-            for _, item in ipairs(series_res.Items) do
-                if item.Id then
-                    item.Type = item.Type or "Series"
-                    item.IsFolder = true
-                    series_cache[item.Id] = item
-                end
-            end
-        end
-
-        for _, id in ipairs(ids) do
-            if not series_cache[id] then
-                series_cache[id] = { Id = id, Name = series_names[id], Type = "Series", IsFolder = true }
-            end
-        end
-    end
-
-    for _, view in ipairs(views_res.Items) do
-        if excludes[view.Id] then
-            table.insert(excluded_views, view)
-        else
-            local url = user_api_url("/Items/Latest?ParentId=" .. view.Id .. "&Fields=RecursiveItemCount,ChildCount&Limit=" .. options.home_latest_limit)
-            local res, latest_info = send_request("GET", url)
-            if not res and is_auth_error(latest_info) then return nil, latest_info end
-            local items = res and (res.Items or res)
-
-            if type(items) == "table" and #items > 0 then
-                local item_type = ""
-                if view.CollectionType == CollectionType.Movies then
-                    item_type = ItemType.Movie
-                elseif view.CollectionType == CollectionType.TvShows or view.CollectionType == CollectionType.Tvs then
-                    item_type = ItemType.Series
-                end
-
-                if item_type == ItemType.Series then
-                    local series_ids = {}
-                    for i = 1, math.min(options.home_latest_limit, #items) do
-                        local item = items[i]
-                        if item.Type == ItemType.Episode and item.SeriesId then
-                            series_ids[item.SeriesId] = true
-                            series_names[item.SeriesId] = series_names[item.SeriesId] or item.SeriesName or item.Name
-                        end
-                    end
-                    fetch_series_entries(series_ids)
-                end
-
-                table.insert(new_items, {
-                    Name = "新增" .. view.Name,
-                    IsFolder = true,
-                    _custom_url = user_api_path("/Items?ParentId=" .. view.Id .. "&IncludeItemTypes=" .. item_type .. "&Recursive=true&SortBy=DateCreated&SortOrder=Descending&Fields=RecursiveItemCount,ChildCount")
-                })
-
-                for i = 1, math.min(options.home_latest_limit, #items) do
-                    local item = items[i]
-                    if item_type == ItemType.Series and item.Type == ItemType.Episode then
-                        if item.SeriesId then
-                            item = series_cache[item.SeriesId]
-                        else
-                            item = nil
-                        end
-                    end
-
-                    if item then
-                        local display_item = copy_table(item)
-                        display_item.IsFolder = display_item.Type == ItemType.Series or
-                            display_item.Type == ItemType.Folder or display_item.Type == ItemType.BoxSet
-                        display_item.IndexNumber = nil
-                        display_item.Name = display_item.Name or ""
-                        table.insert(new_items, display_item)
-                    end
-                end
-            end
-        end
-    end
-
-    table.insert(new_items, {
-        Name = "其他",
-        IsFolder = true,
-        _custom_items = excluded_views
-    })
-
-    return new_items
+local function next_menu_request()
+    menu_request_id = menu_request_id + 1
+    return menu_request_id
 end
 
-local function expand_multipart_items(items)
-    if type(items) ~= "table" then return {} end
+local function is_current_menu_request(request_id)
+    return request_id == menu_request_id and shown and not state.quick_connecting
+end
 
-    local i = 1
-    while i <= #items do
-        local item = items[i]
-        local part_count = item and tonumber(item.PartCount) or 0
-        if item and item.Id and part_count > 1 and not item._parts_resolved then
-            local part_url = api_url("/Videos/" .. item.Id .. "/AdditionalParts")
-            local part_res = send_request("GET", part_url)
-            if part_res and type(part_res.Items) == "table" then
-                local base_name = item.Name or ""
-                item.Name = base_name.." (Part 1)"
-                item._parts_resolved = true
+local function fetch_root_menu_async(request_id, callback)
+    local user_result, user_info
+    local views_result, views_info
+    local initial_pending = 2
 
-                for j, part in ipairs(part_res.Items) do
-                    local expanded_item = copy_table(item)
-                    expanded_item.Id = part.Id
-                    expanded_item.Name = base_name.." (Part "..(j + 1)..")"
-                    table.insert(items, i + j, expanded_item)
+    local function initial_done()
+        initial_pending = initial_pending - 1
+        if initial_pending > 0 or not is_current_menu_request(request_id) then return end
+        if not views_result or type(views_result.Items) ~= "table" then
+            callback(nil, views_info)
+            return
+        end
+        if not user_result and is_auth_error(user_info) then
+            callback(nil, user_info)
+            return
+        end
+
+        local excludes = {}
+        if user_result and user_result.Configuration then
+            add_ids_to_set(excludes, user_result.Configuration.LatestItemsExcludes)
+            add_ids_to_set(excludes, user_result.Configuration.MyMediaExcludes)
+        end
+
+        local views = views_result.Items
+        local latest_by_index = {}
+        local latest_pending = 0
+        local auth_error = nil
+
+        local function build_root_items()
+            if not is_current_menu_request(request_id) then return end
+            if auth_error then callback(nil, auth_error); return end
+
+            local series_ids = {}
+            local series_names = {}
+            for index, view in ipairs(views) do
+                if not excludes[view.Id] then
+                    local items = latest_by_index[index]
+                    if type(items) == "table" and
+                        (view.CollectionType == CollectionType.TvShows or view.CollectionType == CollectionType.Tvs) then
+                        for i = 1, math.min(options.home_latest_limit, #items) do
+                            local item = items[i]
+                            if item.Type == ItemType.Episode and item.SeriesId then
+                                series_ids[item.SeriesId] = true
+                                series_names[item.SeriesId] = series_names[item.SeriesId] or item.SeriesName or item.Name
+                            end
+                        end
+                    end
+                end
+            end
+
+            local ids = {}
+            for id in pairs(series_ids) do table.insert(ids, id) end
+
+            local function finish(series_response)
+                if not is_current_menu_request(request_id) then return end
+
+                local series_cache = {}
+                if series_response and type(series_response.Items) == "table" then
+                    for _, item in ipairs(series_response.Items) do
+                        if item.Id then
+                            item.Type = item.Type or ItemType.Series
+                            item.IsFolder = true
+                            series_cache[item.Id] = item
+                        end
+                    end
+                end
+                for _, id in ipairs(ids) do
+                    if not series_cache[id] then
+                        series_cache[id] = {
+                            Id = id,
+                            Name = series_names[id] or "",
+                            Type = ItemType.Series,
+                            IsFolder = true
+                        }
+                    end
                 end
 
-                i = i + #part_res.Items
+                local new_items = {}
+                local excluded_views = {}
+                for index, view in ipairs(views) do
+                    if excludes[view.Id] then
+                        table.insert(excluded_views, view)
+                    else
+                        local items = latest_by_index[index]
+                        if type(items) == "table" and #items > 0 then
+                            local item_type = ""
+                            if view.CollectionType == CollectionType.Movies then
+                                item_type = ItemType.Movie
+                            elseif view.CollectionType == CollectionType.TvShows or view.CollectionType == CollectionType.Tvs then
+                                item_type = ItemType.Series
+                            end
+
+                            table.insert(new_items, {
+                                Name = "新增" .. (view.Name or ""),
+                                IsFolder = true,
+                                _custom_url = user_api_path(
+                                    "/Items?ParentId=" .. view.Id ..
+                                    "&IncludeItemTypes=" .. item_type ..
+                                    "&Recursive=true&SortBy=DateCreated&SortOrder=Descending" ..
+                                    "&Fields=RecursiveItemCount,ChildCount"
+                                )
+                            })
+
+                            local seen_series = {}
+                            for i = 1, math.min(options.home_latest_limit, #items) do
+                                local item = items[i]
+                                if item_type == ItemType.Series and item.Type == ItemType.Episode then
+                                    if item.SeriesId and not seen_series[item.SeriesId] then
+                                        seen_series[item.SeriesId] = true
+                                        item = series_cache[item.SeriesId]
+                                    else
+                                        item = nil
+                                    end
+                                end
+
+                                if item then
+                                    local display_item = copy_table(item)
+                                    display_item.IsFolder = display_item.Type == ItemType.Series or
+                                        display_item.Type == ItemType.Folder or display_item.Type == ItemType.BoxSet
+                                    display_item.IndexNumber = nil
+                                    display_item.Name = display_item.Name or ""
+                                    table.insert(new_items, display_item)
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if #excluded_views > 0 then
+                    table.insert(new_items, {
+                        Name = "其他",
+                        IsFolder = true,
+                        _custom_items = excluded_views
+                    })
+                end
+                callback(new_items)
+            end
+
+            if #ids == 0 then
+                finish(nil)
+            else
+                send_request_async(
+                    "GET",
+                    user_api_url("/Items?Ids=" .. table.concat(ids, ",") .. "&Fields=RecursiveItemCount,ChildCount"),
+                    function(result, info)
+                        if not result and is_auth_error(info) then callback(nil, info); return end
+                        finish(result)
+                    end
+                )
             end
         end
-        i = i + 1
+
+        for index, view in ipairs(views) do
+            if not excludes[view.Id] then
+                local view_index = index
+                latest_pending = latest_pending + 1
+                local url = user_api_url(
+                    "/Items/Latest?ParentId=" .. view.Id ..
+                    "&Fields=RecursiveItemCount,ChildCount&Limit=" .. options.home_latest_limit
+                )
+                send_request_async("GET", url, function(result, info)
+                    if not is_current_menu_request(request_id) then return end
+                    if not result and is_auth_error(info) then auth_error = info end
+                    latest_by_index[view_index] = result and (result.Items or result) or nil
+                    latest_pending = latest_pending - 1
+                    if latest_pending == 0 then build_root_items() end
+                end)
+            end
+        end
+
+        if latest_pending == 0 then build_root_items() end
     end
 
-    return items
+    send_request_async("GET", user_api_url(""), function(result, info)
+        user_result, user_info = result, info
+        initial_done()
+    end)
+    send_request_async("GET", user_api_url("/Views"), function(result, info)
+        views_result, views_info = result, info
+        initial_done()
+    end)
 end
 
 local function get_item_number(item, field)
@@ -821,26 +893,18 @@ end
 local function update_menu(opts)
     if state.quick_connecting then return end
     opts = opts or {}
+
+    local request_id = next_menu_request()
     local layer = current_layer()
-    local old_items = (type(state.items) == "table") and state.items or {}
+    local old_items = type(state.items) == "table" and state.items or {}
     local previous_selection = get_selection()
     local previous_item = opts.preserve_selection and old_items[previous_selection] or nil
     local previous_id = previous_item and previous_item.Id
 
     mp.osd_message("Loading...", request_timeout + 1)
 
-    local url = ""
-    local is_root = false
-
-    if state.query ~= "" then
-        url = user_api_url("/Items?searchTerm=" .. state.query .. "&Recursive=true&Fields=RecursiveItemCount,ChildCount")
-    elseif state.layer == 1 then
-        is_root = true
-    else
-        url = api_url(layer.url or "")
-    end
-
     local function handle_fetch_error(info)
+        if not is_current_menu_request(request_id) then return end
         if is_auth_error(info) and state.api_key ~= "" then
             msg.warn("Jellyfin token was rejected. Reconnecting...")
             clear_auth()
@@ -858,36 +922,28 @@ local function update_menu(opts)
         end
     end
 
-    if is_root then
-        local root_items, root_info = fetch_root_menu()
-        if not root_items then handle_fetch_error(root_info); return end
-        state.items = root_items
-    elseif layer.items then
-        state.items = copy_table(layer.items)
-    else
-        local json, request_info = send_request("GET", url)
-        if not json then handle_fetch_error(request_info); return end
-        state.items = json.Items or json
-        if type(state.items) ~= "table" then state.items = {} end
-    end
-    state.items = expand_multipart_items(state.items)
-    if state.query == "" and layer.kind == "episodes" then
-        state.items = sort_episode_items(state.items)
-    end
+    local function apply_items(items)
+        if not is_current_menu_request(request_id) then return end
+        state.items = type(items) == "table" and items or {}
+        if state.query == "" and layer.kind == "episodes" then
+            state.items = sort_episode_items(state.items)
+        end
 
-    if state.items and #state.items > 0 then
-        local restored_selection = previous_selection
-        if previous_id then
-            for i, item in ipairs(state.items) do
-                if item.Id == previous_id then
-                    restored_selection = i
-                    break
+        if #state.items > 0 then
+            local restored_selection = previous_selection
+            if previous_id then
+                for index, item in ipairs(state.items) do
+                    if item.Id == previous_id then
+                        restored_selection = index
+                        break
+                    end
                 end
             end
+            set_selection(clamp(restored_selection, 1, #state.items))
+            show_menu()
+            return
         end
-        set_selection(clamp(restored_selection, 1, #state.items))
-        show_menu()
-    else
+
         set_selection(1)
         if state.layer > 1 then
             show_menu()
@@ -895,6 +951,29 @@ local function update_menu(opts)
             shown = false
             mp.osd_message("No items found.", menu_status_osd_duration)
         end
+    end
+
+    if state.query ~= "" then
+        local url = user_api_url(
+            "/Items?searchTerm=" .. state.query ..
+            "&Recursive=true&Fields=RecursiveItemCount,ChildCount"
+        )
+        send_request_async("GET", url, function(result, info)
+            if not result then handle_fetch_error(info); return end
+            apply_items(result.Items or result)
+        end)
+    elseif state.layer == 1 then
+        fetch_root_menu_async(request_id, function(items, info)
+            if not items then handle_fetch_error(info); return end
+            apply_items(items)
+        end)
+    elseif layer.items then
+        apply_items(copy_table(layer.items))
+    else
+        send_request_async("GET", api_url(layer.url or ""), function(result, info)
+            if not result then handle_fetch_error(info); return end
+            apply_items(result.Items or result)
+        end)
     end
 end
 
@@ -917,40 +996,21 @@ local function get_item_title(item)
     return name
 end
 
-local function clean_playlist_display_path(value)
-    local path = tostring(value or ""):gsub("[\r\n]", " ")
-    path = path:gsub("[\\/:%*%?\"<>|]", "-"):gsub("%s+", " ")
-    path = path:gsub("^%s+", ""):gsub("%s+$", "")
-    if path == "" then return "Jellyfin item" end
-    return path
+local playback_path_prefix = "jellyfin-client://"
+
+local function get_playback_path(item)
+    return playback_path_prefix .. tostring(item.Id)
 end
 
-local function get_unique_playlist_display_path(item, used_paths)
-    used_paths = used_paths or {}
-    local base_path = clean_playlist_display_path(get_item_title(item))
-    local path = base_path
-    local index = 2
-
-    while used_paths[path] do
-        path = base_path .. " (" .. tostring(index) .. ")"
-        index = index + 1
-    end
-
-    used_paths[path] = true
-    return path
-end
-
-local function load_video_item(item, mode, playlist_path)
-    local title = get_item_title(item)
-    -- Queued episodes use title-like paths for playlist display; on_load rewrites them to real URLs.
-    if playlist_path then state.playback_items_by_path[playlist_path] = item end
-    mp.command_native({"loadfile", playlist_path or get_stream_url(item), mode, -1, get_playback_options(title, item)})
+local function load_video_item(item, mode)
+    local path = get_playback_path(item)
+    state.playback_items_by_path[path] = item
+    state.playback_items_by_id[item.Id] = item
+    mp.command_native({"loadfile", path, mode, -1, get_playback_options(get_item_title(item), item)})
 end
 
 local function get_playback_item_by_playlist_path(path)
-    if not path then return nil end
-    local basename = tostring(path):match("[^\\/]+$")
-    return state.playback_items_by_path[path] or (basename and state.playback_items_by_path[basename])
+    return path and state.playback_items_by_path[path] or nil
 end
 
 local function remember_playback_items(items)
@@ -963,17 +1023,60 @@ local function remember_playback_items(items)
     end
 end
 
+local inherited_part_fields = {
+    "Type", "SeriesId", "SeriesName", "ParentIndexNumber", "IndexNumber"
+}
+
+local function make_part_item(parent, part, part_number)
+    local item = copy_table(part)
+    for _, field in ipairs(inherited_part_fields) do
+        if item[field] == nil then item[field] = parent[field] end
+    end
+    item.Name = (parent.Name or "") .. " (Part " .. tostring(part_number) .. ")"
+    item.IsFolder = false
+    item._parts_resolved = true
+    return item
+end
+
+local function expand_playback_item(item)
+    local part_count = tonumber(item and item.PartCount) or 0
+    if not item or not item.Id or part_count <= 1 then return { item } end
+
+    local response = send_request("GET", api_url("/Videos/" .. item.Id .. "/AdditionalParts"))
+    if not response or type(response.Items) ~= "table" or #response.Items == 0 then
+        return { item }
+    end
+
+    local parts = { copy_table(item) }
+    parts[1].Name = (item.Name or "") .. " (Part 1)"
+    parts[1]._parts_resolved = true
+    for index, part in ipairs(response.Items) do
+        table.insert(parts, make_part_item(item, part, index + 1))
+    end
+    return parts
+end
+
+local function expand_playback_items(items)
+    local expanded = {}
+    for _, item in ipairs(items or {}) do
+        for _, part in ipairs(expand_playback_item(item)) do
+            table.insert(expanded, part)
+        end
+    end
+    return expanded
+end
+
 local function is_episode_like_item(item)
-    return item and (item.Type == ItemType.Episode or item.SeriesId or item.SeriesName or
-        item.ParentIndexNumber or current_layer().kind == "episodes")
+    return item and (item.Type == ItemType.Episode or item.SeriesId ~= nil)
 end
 
 local function is_same_episode_series(item, selected_item)
     if not item or not selected_item then return false end
     if item.Id == selected_item.Id then return true end
-    if selected_item.SeriesId and item.SeriesId then return item.SeriesId == selected_item.SeriesId end
-    if selected_item.SeriesName and item.SeriesName then return item.SeriesName == selected_item.SeriesName end
-    return current_layer().kind == "episodes"
+    if selected_item.SeriesId then return item.SeriesId == selected_item.SeriesId end
+    if item.SeriesId then return false end
+    return state.query == "" and current_layer().kind == "episodes" and
+        item.Type == ItemType.Episode and selected_item.Type == ItemType.Episode
 end
 
 local function is_following_episode(item, selected_item, item_index, selected_index)
@@ -1030,30 +1133,21 @@ local function play_video()
     if not item or not item.Id then return end
 
     toggle_menu()
-    mp.commandv("playlist-play-index", "none")
-    mp.command("playlist-clear")
 
-    local episode_playlist_items = build_episode_playlist_from_current_menu(selected_index, item)
-    if episode_playlist_items then
-        remember_playback_items(episode_playlist_items)
-        state.playlist_resume_enabled = true
-        local used_paths = {}
-        for i, episode in ipairs(episode_playlist_items) do
-            load_video_item(episode, i == 1 and "replace" or "append", get_unique_playlist_display_path(episode, used_paths))
-        end
-        msg.debug(string.format("Queued %d Jellyfin episode playlist items from current menu.", #episode_playlist_items))
-        return
+    local playlist_items = build_episode_playlist_from_current_menu(selected_index, item) or { item }
+    playlist_items = expand_playback_items(playlist_items)
+    remember_playback_items(playlist_items)
+
+    for index, playlist_item in ipairs(playlist_items) do
+        load_video_item(playlist_item, index == 1 and "replace" or "append")
     end
-
-    remember_playback_items({ item })
-    state.playlist_resume_enabled = false
-    load_video_item(item, "replace")
+    msg.debug(string.format("Queued %d Jellyfin playlist item(s).", #playlist_items))
 end
 
 open_selected_item = function()
     local item = state.items[get_selection()]
     if not item then return end
-    if item.IsFolder == false then
+    if not item.IsFolder then
         play_video()
         return
     end
@@ -1087,69 +1181,98 @@ go_back_layer = function()
 end
 
 connect = function()
-    local res = send_json_request("POST", api_url("/QuickConnect/Initiate"), {
+    local request_id = next_menu_request()
+    mp.osd_message("Connecting to Jellyfin...", request_timeout + 1)
+
+    send_json_request_async("POST", api_url("/QuickConnect/Initiate"), {
         headers = { "Content-Length: 0", get_media_browser_header(false) }
-    })
-    if not res or not res.Code or not res.Secret then
-        shown = false
-        mp.osd_message("Jellyfin 快速连接失败，请检查 URL。", 6)
-        return
-    end
-
-    state.qc_secret = res.Secret
-    state.quick_connecting = true
-    if not show_quick_connect_menu(res.Code) then
-        state.qc_secret = ""
-        state.quick_connecting = false
-        shown = false
-        return
-    end
-
-    if state.qc_timer then state.qc_timer:kill() end
-    state.qc_timer = mp.add_periodic_timer(3, function()
-        local check_res = send_json_request("GET", api_url("/QuickConnect/Connect?secret=" .. url_encode(state.qc_secret)))
-        if not (check_res and check_res.Authenticated) then return end
-
-        if state.qc_timer then state.qc_timer:kill() end
-        state.qc_timer = nil
-
-        local body = safe_json_format({ Secret = state.qc_secret })
-        local auth_res = body and send_json_request("POST", api_url("/Users/AuthenticateWithQuickConnect"), {
-            headers = { "Content-Type: application/json", get_media_browser_header(false) },
-            body = body
-        })
-        if auth_res and auth_res.AccessToken and auth_res.User then
-            state.user_id = auth_res.User.Id
-            state.api_key = auth_res.AccessToken
-            state.quick_connecting = false
-            save_auth(state.user_id, state.api_key)
-            stop_native_select(true)
-            mp.add_timeout(0.05, function()
-                if state.api_key ~= "" and not state.quick_connecting then
-                    update_menu()
-                end
-            end)
+    }, function(response)
+        if request_id ~= menu_request_id or not shown then return end
+        if not response or not response.Code or not response.Secret then
+            shown = false
+            mp.osd_message("Jellyfin 快速连接失败，请检查 URL。", 6)
             return
         end
 
-        state.quick_connecting = false
-        stop_native_select(true)
-        shown = false
-        mp.osd_message("Jellyfin 授权成功，但登录令牌交换失败。", 6)
+        state.qc_secret = response.Secret
+        state.quick_connecting = true
+        if not show_quick_connect_menu(response.Code) then
+            state.qc_secret = ""
+            state.quick_connecting = false
+            shown = false
+            return
+        end
+
+        local secret = response.Secret
+        local poll_inflight = false
+        if state.qc_timer then state.qc_timer:kill() end
+        state.qc_timer = mp.add_periodic_timer(3, function()
+            if poll_inflight or not state.quick_connecting or state.qc_secret ~= secret then return end
+            poll_inflight = true
+
+            send_json_request_async(
+                "GET",
+                api_url("/QuickConnect/Connect?secret=" .. url_encode(secret)),
+                nil,
+                function(check_response)
+                    poll_inflight = false
+                    if not state.quick_connecting or state.qc_secret ~= secret then return end
+                    if not (check_response and check_response.Authenticated) then return end
+
+                    if state.qc_timer then state.qc_timer:kill() end
+                    state.qc_timer = nil
+
+                    local body = safe_json_format({ Secret = secret })
+                    if not body then
+                        state.quick_connecting = false
+                        stop_native_select(true)
+                        shown = false
+                        return
+                    end
+
+                    send_json_request_async("POST", api_url("/Users/AuthenticateWithQuickConnect"), {
+                        headers = { "Content-Type: application/json", get_media_browser_header(false) },
+                        body = body
+                    }, function(auth_response)
+                        if not state.quick_connecting or state.qc_secret ~= secret then return end
+
+                        state.quick_connecting = false
+                        state.qc_secret = ""
+                        stop_native_select(true)
+
+                        if auth_response and auth_response.AccessToken and auth_response.User then
+                            state.user_id = auth_response.User.Id
+                            state.api_key = auth_response.AccessToken
+                            save_auth(state.user_id, state.api_key)
+                            mp.add_timeout(0.05, function()
+                                if state.api_key ~= "" and shown then update_menu() end
+                            end)
+                            return
+                        end
+
+                        shown = false
+                        mp.osd_message("Jellyfin 授权成功，但登录令牌交换失败。", 6)
+                    end)
+                end
+            )
+        end)
     end)
 end
 
 close_menu = function(opts)
     opts = opts or {}
+    next_menu_request()
     stop_native_select(opts.terminate_select)
 
     if state.qc_timer then
         state.qc_timer:kill()
         state.qc_timer = nil
-        state.quick_connecting = false
         mp.osd_message("", 0)
     end
+    state.quick_connecting = false
+    state.qc_secret = ""
     shown = false
+    mp.osd_message("", 0)
 end
 
 toggle_menu = function()
@@ -1170,12 +1293,40 @@ end
 -- 播放器事件集成
 ---------------------------------------------------------------------
 
-local function resolve_jellyfin_playlist_path()
+local function apply_playback_item_details(item, details)
+    if type(details) ~= "table" then return item end
+    for key, value in pairs(item) do
+        if details[key] == nil then details[key] = value end
+    end
+    return details
+end
+
+local function set_resolved_playback_item(path, item)
+    state.playback_items_by_path[path] = item
+    state.playback_items_by_id[item.Id] = item
+    mp.set_property("stream-open-filename", get_stream_url(item))
+end
+
+local function resolve_jellyfin_playlist_path(hook)
     local path = mp.get_property("stream-open-filename") or mp.get_property("path")
     local item = get_playback_item_by_playlist_path(path)
-    if item and item.Id then
-        mp.set_property("stream-open-filename", get_stream_url(item))
+    if not item or not item.Id then return end
+
+    local source = get_media_source(item)
+    if source and type(source.MediaStreams) == "table" then
+        set_resolved_playback_item(path, item)
+        return
     end
+
+    hook:defer()
+    send_request_async(
+        "GET",
+        user_api_url("/Items/" .. item.Id .. "?Fields=MediaSources,MediaStreams"),
+        function(details)
+            set_resolved_playback_item(path, apply_playback_item_details(item, details))
+            hook:cont()
+        end
+    )
 end
 
 local function get_playing_item()
@@ -1209,18 +1360,15 @@ local function get_position_ticks(prefer_duration)
     return nil
 end
 
-local function get_playback_report(prefer_duration)
-    local item = get_playing_item()
-    local ticks = get_position_ticks(prefer_duration)
+local function get_active_playback_report(prefer_duration)
+    local active = state.active_playback
+    if not active then return nil, nil end
 
-    if not item and state.last_playback_item then item = state.last_playback_item end
-    if item and not ticks and state.last_playback_item_id == item.Id then ticks = state.last_position_ticks end
-    if not item or not ticks then return nil, nil end
+    local ticks = get_position_ticks(prefer_duration) or active.position_ticks
+    if ticks == nil then return nil, nil end
 
-    state.last_playback_item = item
-    state.last_playback_item_id = item.Id
-    state.last_position_ticks = ticks
-    return item, ticks
+    active.position_ticks = ticks
+    return active.item, ticks
 end
 
 local function get_playback_base_body(item, ticks)
@@ -1255,12 +1403,21 @@ local function playback_request_failed(success, result)
     return status and not is_http_success(status)
 end
 
-local function send_playback_request(endpoint, body, sync)
-    local content = safe_json_format(body)
-    if not content then return end
+local playback_report_queue = {}
+local playback_report_inflight = nil
+local playback_report_async_id = nil
+local playback_generation = 0
 
+local function send_playback_request(endpoint, body, sync, callback)
+    local content = safe_json_format(body)
+    if not content then
+        if callback then callback(false) end
+        return nil
+    end
+
+    local timeout = sync and 3 or (endpoint == "/Sessions/Playing/Progress" and 5 or request_timeout)
     local args = build_curl_args("POST", api_url(endpoint), {
-        timeout = sync and 3 or request_timeout,
+        timeout = timeout,
         headers = { "Content-Type: application/json", get_api_auth_header() },
         body = content,
         extra_args = { "-w", "\n%{http_code}" }
@@ -1268,58 +1425,139 @@ local function send_playback_request(endpoint, body, sync)
 
     if sync then
         local result = run_curl(args)
-        if playback_request_failed(result ~= nil, result) then
-            msg.debug("Playback report failed: " .. endpoint)
-        end
-        return
+        local ok = not playback_request_failed(result ~= nil, result)
+        if not ok then msg.debug("Playback report failed: " .. endpoint) end
+        if callback then callback(ok) end
+        return nil
     end
 
-    mp.command_native_async({
+    return mp.command_native_async({
         name = "subprocess",
         playback_only = false,
         capture_stdout = true,
         capture_stderr = true,
         args = args
     }, function(success, result)
-        if playback_request_failed(success, result) then
-            msg.debug("Playback report failed: " .. endpoint)
-        end
+        local ok = not playback_request_failed(success, result)
+        if not ok then msg.debug("Playback report failed: " .. endpoint) end
+        if callback then callback(ok) end
     end)
+end
+
+local dispatch_playback_report
+
+dispatch_playback_report = function()
+    if playback_report_inflight or #playback_report_queue == 0 then return end
+
+    local report = table.remove(playback_report_queue, 1)
+    playback_report_inflight = report
+    local async_id = send_playback_request(report.endpoint, report.body, false, function()
+        if playback_report_inflight ~= report then return end
+        playback_report_inflight = nil
+        playback_report_async_id = nil
+        dispatch_playback_report()
+    end)
+    if playback_report_inflight == report then playback_report_async_id = async_id end
+end
+
+local function enqueue_playback_report(kind, generation, endpoint, body, defer_dispatch)
+    if kind == "progress" then
+        for index = #playback_report_queue, 1, -1 do
+            local queued = playback_report_queue[index]
+            if queued.generation == generation then
+                if queued.kind == "stop" then return end
+                if queued.kind == "progress" then
+                    queued.body = body
+                    return
+                end
+            end
+        end
+    elseif kind == "stop" then
+        for index = #playback_report_queue, 1, -1 do
+            local queued = playback_report_queue[index]
+            if queued.generation == generation and queued.kind == "progress" then
+                table.remove(playback_report_queue, index)
+            end
+        end
+    end
+
+    table.insert(playback_report_queue, {
+        kind = kind,
+        generation = generation,
+        endpoint = endpoint,
+        body = body
+    })
+    if not defer_dispatch then dispatch_playback_report() end
+end
+
+local function flush_playback_reports_sync()
+    local reports = {}
+    if playback_report_inflight then table.insert(reports, playback_report_inflight) end
+    for _, report in ipairs(playback_report_queue) do table.insert(reports, report) end
+
+    if playback_report_async_id then mp.abort_async_command(playback_report_async_id) end
+    playback_report_async_id = nil
+    playback_report_inflight = nil
+    playback_report_queue = {}
+
+    for _, report in ipairs(reports) do
+        send_playback_request(report.endpoint, report.body, true)
+    end
 end
 
 local function send_jellyfin_started(sync)
     if state.api_key == "" or state.user_id == "" then return end
 
-    local item, ticks = get_playback_report(false)
-    if not item then return end
+    local active = state.active_playback
+    local item, ticks = get_active_playback_report(false)
+    if not active or not item then return end
 
     local is_paused = mp.get_property_bool("pause") == true
-    state.last_stop_key = ""
-    send_playback_request("/Sessions/Playing", get_playback_state_body(item, ticks, is_paused), sync)
+    enqueue_playback_report(
+        "start",
+        active.generation,
+        "/Sessions/Playing",
+        get_playback_state_body(item, ticks, is_paused),
+        sync
+    )
+    if sync then flush_playback_reports_sync() end
 end
 
 local function send_jellyfin_progress(is_paused, sync)
     if state.api_key == "" or state.user_id == "" then return end
 
-    local item, ticks = get_playback_report(false)
-    if not item then return end
+    local active = state.active_playback
+    local item, ticks = get_active_playback_report(false)
+    if not active or not item then return end
 
     if is_paused == nil then is_paused = mp.get_property_bool("pause") == true end
-    state.last_stop_key = ""
-    send_playback_request("/Sessions/Playing/Progress", get_playback_state_body(item, ticks, is_paused), sync)
+    enqueue_playback_report(
+        "progress",
+        active.generation,
+        "/Sessions/Playing/Progress",
+        get_playback_state_body(item, ticks, is_paused),
+        sync
+    )
+    if sync then flush_playback_reports_sync() end
 end
 
 local function send_jellyfin_stopped(event, sync)
-    if state.api_key == "" or state.user_id == "" then return end
+    local active = state.active_playback
+    state.active_playback = nil
 
-    local item, ticks = get_playback_report(event and event.reason == "eof")
-    if not item then return end
+    if state.api_key == "" or state.user_id == "" or not active then return end
 
-    local stop_key = item.Id .. ":" .. ticks_query_value(ticks)
-    if state.last_stop_key == stop_key then return end
-    state.last_stop_key = stop_key
+    local ticks = get_position_ticks(event and event.reason == "eof") or active.position_ticks
+    if ticks == nil then return end
 
-    send_playback_request("/Sessions/Playing/Stopped", get_playback_stop_body(item, ticks, event), sync)
+    enqueue_playback_report(
+        "stop",
+        active.generation,
+        "/Sessions/Playing/Stopped",
+        get_playback_stop_body(active.item, ticks, event),
+        sync
+    )
+    if sync then flush_playback_reports_sync() end
 end
 
 local function download_and_add_subtitle(item, source, stream, ext)
@@ -1332,10 +1570,23 @@ local function download_and_add_subtitle(item, source, stream, ext)
     if safe_ext == "unknown" then safe_ext = "srt" end
     local filepath = subtitle_dir .. "/" .. safe_filename_part(item.Id) .. "_" ..
         safe_filename_part(source.Id) .. "_" .. safe_filename_part(stream.Index) .. "." .. safe_ext
+    local temp_filepath = filepath .. ".part"
     local url = get_subtitle_url(item.Id, source.Id, stream.Index, ext)
     local expected_item_id = item.Id
     local title = stream.DisplayTitle
     local language = stream.Language
+
+    local cached = io.open(filepath, "rb")
+    if cached then
+        local size = cached:seek("end")
+        cached:close()
+        if size and size > 0 then
+            mp.commandv("sub-add", filepath, "auto", title, language)
+            return
+        end
+        os.remove(filepath)
+    end
+    os.remove(temp_filepath)
 
     mp.command_native_async({
         name = "subprocess",
@@ -1345,22 +1596,28 @@ local function download_and_add_subtitle(item, source, stream, ext)
         args = build_curl_args(nil, url, {
             timeout = subtitle_timeout,
             headers = { get_api_auth_header() },
-            extra_args = { "-L", "-f", "-o", filepath }
+            extra_args = { "-L", "-f", "-o", temp_filepath }
         })
     }, function(success, result)
         if not success or not result or result.status ~= 0 then
+            os.remove(temp_filepath)
             msg.warn("Failed to download Jellyfin subtitle: " .. url)
             return
         end
-        local current_item = get_playing_item()
-        if current_item and current_item.Id == expected_item_id then
+        if not os.rename(temp_filepath, filepath) then
+            os.remove(temp_filepath)
+            msg.warn("Failed to cache Jellyfin subtitle: " .. filepath)
+            return
+        end
+        local active = state.active_playback
+        if active and active.item.Id == expected_item_id then
             mp.commandv("sub-add", filepath, "auto", title, language)
         end
     end)
 end
 
-local function add_subs()
-    local item = get_playing_item()
+local function add_subs(item)
+    item = item or (state.active_playback and state.active_playback.item)
     if not item or not item.MediaSources then return end
 
     local source = get_media_source(item)
@@ -1382,18 +1639,21 @@ local function add_subs()
     end
 end
 
-local function apply_playlist_resume()
-    if not state.playlist_resume_enabled then return end
-
-    local item = get_playing_item()
-    local resume_seconds = get_resume_seconds(item)
-    if resume_seconds then mp.commandv("seek", resume_seconds, "absolute", "exact") end
-end
-
 local function on_file_loaded()
-    apply_playlist_resume()
+    local item = get_playing_item()
+    if not item then
+        state.active_playback = nil
+        return
+    end
+
+    playback_generation = playback_generation + 1
+    state.active_playback = {
+        item = item,
+        generation = playback_generation,
+        position_ticks = get_position_ticks(false) or 0
+    }
     send_jellyfin_started()
-    add_subs()
+    add_subs(item)
 end
 
 local function unpause()
@@ -1416,7 +1676,11 @@ local function on_end_file(event)
 end
 
 local function on_shutdown()
-    send_jellyfin_stopped(nil, true)
+    if state.active_playback then
+        send_jellyfin_stopped(nil, true)
+    else
+        flush_playback_reports_sync()
+    end
 end
 
 local function search(query)
