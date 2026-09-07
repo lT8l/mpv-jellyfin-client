@@ -4,7 +4,6 @@ local msg = require "mp.msg"
 local input = require "mp.input"
 
 local options = {
-    url = "",
     cache_path = "~~cache/jellyfin_client",
     show_by_default = "",
     show_on_idle = "",
@@ -14,7 +13,6 @@ local options = {
 
 options_module.read_options(options, mp.get_script_name())
 
-options.url = tostring(options.url or ""):gsub("/+$", "")
 options.home_latest_limit = math.floor(tonumber(options.home_latest_limit) or 9)
 options.page_size = math.floor(tonumber(options.page_size) or 100)
 if options.home_latest_limit < 1 then options.home_latest_limit = 9 end
@@ -80,6 +78,7 @@ local all_include_types = table.concat({
 
 local state = {
     auth = {
+        server_url = "",
         device_id = "",
         user_id = "",
         access_token = "",
@@ -88,7 +87,7 @@ local state = {
     layers = {
         { kind = "root", title = "Jellyfin", selection = 1 },
     },
-    entries = {},
+    pending_search = nil,
     menu_generation = 0,
     menu_requests = {},
     select_session = 0,
@@ -163,7 +162,13 @@ end
 
 local function api_url(path)
     if tostring(path):match("^https?://") then return path end
-    return options.url .. path
+    return state.auth.server_url .. path
+end
+
+local function normalize_server_url(value)
+    if type(value) ~= "string" then return nil end
+    value = value:gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+    if value:match("^https?://[^/%s?#]+[^%s?#]*$") then return value end
 end
 
 local function user_items_path(parameters)
@@ -224,7 +229,7 @@ local function save_auth()
     local content, json_error = utils.format_json({
         version = AUTH_VERSION,
         device_id = state.auth.device_id,
-        server_url = options.url,
+        server_url = state.auth.server_url,
         user_id = state.auth.user_id,
         access_token = state.auth.access_token,
     })
@@ -255,7 +260,8 @@ local function load_auth()
     if type(saved) == "table" and saved.version == AUTH_VERSION and
         type(saved.device_id) == "string" and saved.device_id ~= "" then
         state.auth.device_id = saved.device_id
-        if saved.server_url == options.url then
+        state.auth.server_url = normalize_server_url(saved.server_url) or ""
+        if state.auth.server_url ~= "" then
             state.auth.user_id = tostring(saved.user_id or "")
             state.auth.access_token = tostring(saved.access_token or "")
         end
@@ -372,12 +378,13 @@ local function parse_http_result(success, result, error_message)
         ok = false,
         status = nil,
         curl_status = result and result.status or nil,
-        error = error_message,
+        error = result and result.stderr ~= "" and result.stderr or error_message or
+            (result and result.error_string),
     }
     if not success or not result or result.status ~= 0 then return nil, info end
 
     local body, code = tostring(result.stdout or ""):match("^(.*)\n(%d%d%d)$")
-    if not body then return nil, info end
+    if not body then info.error = "invalid HTTP response"; return nil, info end
     info.status = tonumber(code)
     if info.status < 200 or info.status >= 300 then return nil, info end
 
@@ -389,6 +396,13 @@ local function parse_http_result(success, result, error_message)
         info.error = json_error or "invalid JSON"
     end
     return value, info
+end
+
+local function log_request_error(method, path, info, result)
+    if info.ok or (result and result.killed_by_us) then return end
+    msg.debug(string.format("Jellyfin %s %s：HTTP %s，curl %s，%s", method,
+        path:match("^[^?]*"), tostring(info.status or "-"),
+        tostring(info.curl_status or "-"), tostring(info.error or "请求失败")))
 end
 
 local function track_request(tracker, request_id)
@@ -448,6 +462,7 @@ local function request_json(method, path, request_options, tracker, callback)
     }, function(success, result, error_message)
         if tracker then untrack_request(tracker, request_id) end
         local value, info = parse_http_result(success, result, error_message)
+        log_request_error(method, path, info, result)
         callback(value, info)
     end)
     if tracker then track_request(tracker, request_id) end
@@ -457,13 +472,16 @@ end
 local function request_sync(method, path, request_options)
     local args = api_request_args(method, path, request_options)
     if not args then return nil end
-    return mp.command_native({
+    local result, error_message = mp.command_native({
         name = "subprocess",
         playback_only = false,
         capture_stdout = true,
         capture_stderr = true,
         args = args,
     })
+    local _, info = parse_http_result(result ~= nil, result, error_message)
+    log_request_error(method, path, info, result)
+    return result
 end
 
 local function is_auth_error(info)
@@ -591,6 +609,7 @@ end
 
 local function close_menu(terminate)
     state.shown = false
+    state.pending_search = nil
     cancel_menu_requests()
     if state.quick.active then cancel_quick_connect(false) end
     invalidate_select(terminate ~= false)
@@ -599,6 +618,8 @@ end
 
 local function reconnect()
     cancel_menu_requests()
+    local layer = current_layer()
+    if layer.kind == "search" then state.pending_search = layer.query end
     clear_credentials()
     state.shown = true
     start_quick_connect()
@@ -624,7 +645,6 @@ local function show_request_error(info)
 end
 
 local function show_entries(entries)
-    state.entries = entries or {}
     local layer = current_layer()
     local labels = {}
     local actions = {}
@@ -634,7 +654,7 @@ local function show_entries(entries)
         labels[1] = "‹ 返回"
         actions[1] = { kind = "back" }
     end
-    for index, entry in ipairs(state.entries) do
+    for index, entry in ipairs(entries) do
         labels[index + offset] = entry.label
         actions[index + offset] = entry
     end
@@ -811,12 +831,6 @@ local function root_latest_item(view, raw_item)
     if (collection_type == "tvshows" or collection_type == "tvs") and
         item.Type == "Episode" and item.SeriesId then
         series_id = item.SeriesId
-        item = normalize_item({
-            Id = series_id,
-            Name = item.SeriesName ~= "" and item.SeriesName or item.Name,
-            Type = "Series",
-            IsFolder = true,
-        })
     end
     if not is_allowed_item(item) then return nil end
     return item, series_id
@@ -883,6 +897,9 @@ local function load_root(generation)
                                 local item = normalize_item(raw_item)
                                 if item and item.Type == "Series" then series_by_id[item.Id] = item end
                             end
+                            for _, id in ipairs(ids) do
+                                if not series_by_id[id] then msg.warn("首页未返回系列：" .. id) end
+                            end
                         else
                             msg.warn("读取首页系列信息失败。")
                         end
@@ -896,8 +913,9 @@ local function load_root(generation)
             for _, group in ipairs(visible_views) do
                 entries[#entries + 1] = group.route
                 for _, candidate in ipairs(group.latest) do
-                    entries[#entries + 1] = item_entry(
-                        candidate.series_id and series_by_id[candidate.series_id] or candidate.item)
+                    local item = candidate.item
+                    if candidate.series_id then item = series_by_id[candidate.series_id] end
+                    if item then entries[#entries + 1] = item_entry(item) end
                 end
             end
             if #other_entries > 0 then
@@ -929,8 +947,9 @@ local function load_root(generation)
                         local seen = {}
                         for _, raw_item in ipairs(type(values) == "table" and values or {}) do
                             local item, series_id = root_latest_item(group.view, raw_item)
-                            if item and not seen[item.Id] then
-                                seen[item.Id] = true
+                            local id = series_id or (item and item.Id)
+                            if id and not seen[id] then
+                                seen[id] = true
                                 group.latest[#group.latest + 1] = {
                                     item = item,
                                     series_id = series_id,
@@ -984,6 +1003,8 @@ local function load_items(layer, generation)
     if layer.kind ~= "episodes" then
         parameters.StartIndex = (layer.page or 0) * options.page_size
         parameters.Limit = options.page_size
+    else
+        parameters.Fields = parameters.Fields .. ",DateCreated"
     end
 
     request_json("GET", user_items_path(parameters), nil, state.menu_requests, function(value, info)
@@ -1081,6 +1102,7 @@ local function load_live_channels(layer, generation)
 end
 
 load_current_layer = function()
+    if not state.shown then return end
     cancel_menu_requests()
     local generation = state.menu_generation
     local layer = current_layer()
@@ -1117,7 +1139,7 @@ local function build_report_body(session, kind, failed)
         body.CanSeek = session.entry.kind ~= "live"
         body.IsPaused = session.is_paused == true
         body.IsMuted = session.is_muted == true
-        body.PlayMethod = "DirectPlay"
+        body.PlayMethod = session.entry.remux and "DirectStream" or "DirectPlay"
     else
         body.Failed = failed == true
     end
@@ -1344,12 +1366,14 @@ local function download_subtitle(session, source, stream)
             headers = { authorization_header(true) },
             extra_args = { "-f", "-o", filepath },
         }),
-    }, function(success, result)
+    }, function(success, result, error_message)
         untrack_request(session.subtitle_requests, request_id)
         if state.playback.active ~= session then return end
         if success and result and result.status == 0 then
             mp.commandv("sub-add", filepath, "auto", stream.DisplayTitle or "", stream.Language or "")
         else
+            local _, info = parse_http_result(false, result, error_message)
+            log_request_error("GET", path, info, result)
             msg.warn("下载 Jellyfin 字幕失败：" .. tostring(stream.DisplayTitle or stream.Index))
         end
     end)
@@ -1389,8 +1413,11 @@ local function stream_url(entry)
     end
     local prefix = entry.kind == "audio" and "/Audio/" or "/Videos/"
     if entry.kind == "live" then
-        return api_url(with_query(prefix .. entry.item.Id .. "/stream", {
-            static = "true",
+        return api_url(with_query(prefix .. entry.item.Id .. (entry.remux and "/stream.ts" or "/stream"), {
+            static = entry.remux and "false" or "true",
+            VideoCodec = entry.remux and "copy" or nil,
+            AudioCodec = entry.remux and "copy" or nil,
+            SubtitleStreamIndex = entry.remux and -1 or nil,
             DeviceId = state.auth.device_id,
             PlaySessionId = entry.session_id,
             MediaSourceId = entry.media_source_id,
@@ -1432,6 +1459,9 @@ local function playback_options(entry)
 end
 
 local function start_playlist(items)
+    for _, entry in pairs(state.playback.live) do
+        if not entry.started then close_live_stream(entry, false) end
+    end
     state.playback.planned = {}
     for _, wrapper in ipairs(items) do
         local entry = wrapper.entry or {
@@ -1517,6 +1547,7 @@ local function prepare_live_playback(item)
             session_id = value.PlaySessionId,
             media_source_id = source.Id,
             live_stream_id = source.LiveStreamId,
+            remux = source.Protocol == "Udp" or source.Protocol == "Rtp",
         }
         mp.osd_message("", 0)
         start_playlist({ { item = item, entry = entry } })
@@ -1662,10 +1693,20 @@ local function show_quick_connect(code, generation, status)
                 end)
                 return
             end
-            cancel_quick_connect(false)
-            state.shown = false
+            close_menu(false)
         end,
     })
+end
+
+local function apply_pending_search()
+    if not state.pending_search then return end
+    local query = state.pending_search
+    state.pending_search = nil
+    state.layers = {
+        { kind = "root", title = "Jellyfin", selection = 1 },
+        { kind = "search", title = "搜索：" .. query, query = query,
+            include_types = all_include_types, recursive = true, page = 0, selection = 1 },
+    }
 end
 
 local function finish_quick_connect(generation)
@@ -1688,6 +1729,7 @@ local function finish_quick_connect(generation)
         cancel_quick_connect(true)
         state.shown = true
         state.layers = { { kind = "root", title = "Jellyfin", selection = 1 } }
+        apply_pending_search()
         defer(load_current_layer)
     end)
 end
@@ -1702,15 +1744,17 @@ local function poll_quick_connect(generation)
         if value and value.Authenticated == true then
             if state.quick.timer then state.quick.timer:kill(); state.quick.timer = nil end
             finish_quick_connect(generation)
-        elseif info and info.status and info.status ~= 404 then
-            msg.debug("快速连接轮询失败：HTTP " .. tostring(info.status))
+        elseif info and (info.status == 404 or info.status == 401) then
+            close_menu(true)
+            mp.osd_message(info.status == 404 and
+                "快速连接验证码已失效，请重新打开 Jellyfin 菜单。" or
+                "服务器快速连接不可用，请检查服务器设置。", 6)
         end
     end)
 end
 
 start_quick_connect = function()
     cancel_quick_connect(true)
-    state.quick.generation = state.quick.generation + 1
     local generation = state.quick.generation
     state.quick.active = true
     state.shown = true
@@ -1735,31 +1779,56 @@ start_quick_connect = function()
     end)
 end
 
-local function toggle_menu()
-    if state.shown then
-        close_menu(true)
-        return
-    end
-    if options.url == "" then
-        mp.osd_message("请先在 jellyfin_client.conf 中设置 Jellyfin 地址。", 6)
-        return
-    end
+local function prompt_server()
+    local session = state.select_session
+    local server_url
+    input.get({
+        prompt = "Jellyfin 服务器地址（http:// 或 https://）：",
+        id = "jellyfin-server",
+        submit = function(value)
+            server_url = normalize_server_url(value)
+            if not server_url then
+                mp.osd_message("请输入有效的 HTTP/HTTPS 服务器地址。", 5)
+                return
+            end
+            input.terminate()
+        end,
+        closed = function()
+            if session ~= state.select_session then return end
+            if not server_url then close_menu(false); return end
+            defer(function()
+                if session ~= state.select_session then return end
+                state.auth.server_url = server_url
+                save_auth()
+                start_quick_connect()
+            end)
+        end,
+    })
+end
+
+local function open_menu()
+    if state.shown then return end
+    invalidate_select(true)
     state.shown = true
-    if state.auth.user_id == "" or state.auth.access_token == "" then
+    if state.auth.server_url == "" then
+        prompt_server()
+    elseif state.auth.user_id == "" or state.auth.access_token == "" then
         start_quick_connect()
     else
+        apply_pending_search()
         load_current_layer()
     end
 end
 
+local function toggle_menu()
+    if state.shown then close_menu(true) else open_menu() end
+end
+
 local function search()
-    if options.url == "" then
-        mp.osd_message("请先设置 Jellyfin 地址。", 5)
-        return
-    end
     local reopen = state.shown
     if reopen then close_menu(true) end
     invalidate_select(false)
+    state.shown = true
     local session = state.select_session
     local pending_query
     input.get({
@@ -1775,24 +1844,12 @@ local function search()
             if session ~= state.select_session then return end
             defer(function()
                 if session ~= state.select_session then return end
+                state.shown = false
                 if pending_query then
-                    state.layers = {
-                        { kind = "root", title = "Jellyfin", selection = 1 },
-                        {
-                            kind = "search",
-                            title = "搜索：" .. pending_query,
-                            query = pending_query,
-                            include_types = all_include_types,
-                            recursive = true,
-                            page = 0,
-                            selection = 1,
-                        },
-                    }
-                    state.shown = true
-                    if state.auth.access_token == "" then start_quick_connect() else load_current_layer() end
+                    state.pending_search = pending_query
+                    open_menu()
                 elseif reopen then
-                    state.shown = true
-                    load_current_layer()
+                    open_menu()
                 end
             end)
         end,
@@ -1810,9 +1867,11 @@ local function on_file_loaded()
         state.playback.active = nil
         return
     end
+    entry.started = true
+    local saved_ticks = math.floor((resume_seconds(entry.item) or 0) * TICKS_PER_SECOND)
     local session = {
         entry = entry,
-        position_ticks = math.floor((resume_seconds(entry.item) or 0) * TICKS_PER_SECOND),
+        position_ticks = saved_ticks,
         duration_ticks = nil,
         is_paused = false,
         is_muted = false,
@@ -1820,7 +1879,6 @@ local function on_file_loaded()
     }
     state.playback.active = session
     snapshot_session(session, false)
-    local saved_ticks = math.floor((resume_seconds(entry.item) or 0) * TICKS_PER_SECOND)
     if saved_ticks > session.position_ticks then session.position_ticks = saved_ticks end
     enqueue_report("started", session)
     if entry.kind == "video" then load_external_subtitles(session) end
@@ -1919,10 +1977,10 @@ else
     mp.register_event("end-file", on_end_file)
     mp.register_event("shutdown", on_shutdown)
 
-    if options.show_by_default == "on" then defer(toggle_menu) end
+    if options.show_by_default == "on" then defer(open_menu) end
     if options.show_on_idle == "on" then
         mp.observe_property("idle-active", "bool", function(_, idle)
-            if idle and not state.shown then toggle_menu() end
+            if idle then open_menu() end
         end)
     end
 end

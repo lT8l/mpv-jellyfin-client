@@ -174,7 +174,6 @@ function utils_mock.getpid() return 42 end
 
 local options_mock = {}
 function options_mock.read_options(options)
-    options.url = "http://jellyfin.test"
     options.cache_path = "CACHE"
     options.home_latest_limit = 2
     options.page_size = 2
@@ -221,7 +220,10 @@ function mp.command_native(command)
         return command[2]
     end
     mock.commands[#mock.commands + 1] = command
-    if command.name == "subprocess" then return { status = mock.subprocess_status, stdout = "" } end
+    if command.name == "subprocess" then
+        return { status = mock.subprocess_status,
+            stdout = command.args[1] == "curl" and "\n204" or "" }
+    end
     return {}
 end
 
@@ -326,12 +328,18 @@ assert_true(auth_content, "首次启动没有写入认证状态")
 local initial_auth = json_values[auth_content]
 assert_equal(initial_auth.version, 3, "认证格式版本错误")
 assert_true(type(initial_auth.device_id) == "string" and initial_auth.device_id ~= "", "设备 ID 未生成")
-assert_equal(initial_auth.server_url, "http://jellyfin.test", "新认证没有绑定当前服务器")
+assert_equal(initial_auth.server_url, "", "新认证不应沿用旧版服务器")
 assert_equal(initial_auth.user_id, "", "旧认证用户仍被复用")
 assert_equal(initial_auth.access_token, "", "旧认证令牌仍被复用")
 assert_true(initial_auth.device_id ~= "old-device", "旧设备 ID 仍被复用")
 
 mock.keybindings.jf()
+assert_equal(input_mock.current.id, "jellyfin-server", "首次打开没有询问服务器地址")
+input_mock.current.submit("ftp://invalid")
+assert_equal(input_mock.current.id, "jellyfin-server", "无效地址关闭了输入")
+assert_equal(#mock.async, 0, "无效地址发出了请求")
+submit_current("  http://jellyfin.test///  ")
+assert_equal(json_values[auth_content].server_url, "http://jellyfin.test", "服务器地址没有规范化保存")
 local quick_initiate = next_request("/QuickConnect/Initiate")
 assert_equal(command_method(quick_initiate), "POST", "快速连接初始化方法错误")
 assert_true(command_header(quick_initiate, "Authorization: MediaBrowser "),
@@ -783,11 +791,13 @@ respond(rejected_playback_info, {
     MediaSources = {
         {
             Id = "opened-transcode-source",
+            Protocol = "Http",
             LiveStreamId = "opened-transcode-stream",
             TranscodingUrl = "/Videos/ActiveEncodings/rejected/master.m3u8",
         },
         {
             Id = "different-direct-source",
+            Protocol = "Http",
             SupportsDirectPlay = true,
         },
     },
@@ -804,7 +814,11 @@ assert_true(command_url(rejected_live_close):find("opened%-transcode%-stream"),
     "不可直连时没有关闭 Jellyfin 实际打开的直播源")
 respond(rejected_live_close, nil, 204)
 
-local function start_live(stream_id)
+local function start_live(stream_id, protocol)
+    protocol = protocol or "Http"
+    local remux = protocol == "Udp" or protocol == "Rtp"
+    local source_path = protocol == "Udp" and "udp://239.1.1.1:1234" or
+        protocol == "Rtp" and "rtp://239.1.1.2:1234" or "http://upstream.test/live.ts"
     submit_search("channel", {
         {
             Id = "channel",
@@ -824,6 +838,8 @@ local function start_live(stream_id)
         MediaSources = {
             {
                 Id = "live-source",
+                Protocol = protocol,
+                Path = source_path,
                 LiveStreamId = stream_id,
                 SupportsDirectPlay = true,
             },
@@ -831,6 +847,13 @@ local function start_live(stream_id)
     })
     local live_load = last_loadfile()
     assert_true(live_load[2]:find("/Videos/channel/stream", 1, true), "直播地址错误")
+    assert_true(live_load[2]:find(remux and "/stream.ts?" or "/stream?", 1, true), "直播输出路径错误")
+    assert_true(live_load[2]:find("static=" .. (remux and "false" or "true"), 1, true),
+        "直播没有按协议选择静态播放或转封装")
+    for _, parameter in ipairs({ "VideoCodec=copy", "AudioCodec=copy", "SubtitleStreamIndex=-1" }) do
+        assert_equal(live_load[2]:find(parameter, 1, true) ~= nil, remux, "直播流复制参数错误: " .. parameter)
+    end
+    assert_true(not live_load[2]:find(source_path, 1, true), "原始直播源地址不应交给 mpv")
     assert_true(live_load[2]:find("LiveStreamId=" .. stream_id, 1, true), "直播地址缺少 LiveStreamId")
     assert_true(live_load[2]:find("PlaySessionId=live-session-" .. stream_id, 1, true), "直播地址缺少服务端会话 ID")
     assert_true(live_load[2]:find("MediaSourceId=live-source", 1, true), "直播地址缺少媒体源 ID")
@@ -845,10 +868,16 @@ local function start_live(stream_id)
     assert_equal(command_body(live_started).CanSeek, false, "直播错误标记为可跳转")
     assert_equal(command_body(live_started).PositionTicks, 0, "直播错误上报了文件时间轴")
     assert_equal(command_body(live_started).LiveStreamId, stream_id, "直播开始上报缺少 LiveStreamId")
+    assert_equal(command_body(live_started).PlayMethod, remux and "DirectStream" or "DirectPlay",
+        "直播开始上报的播放方式错误")
     respond(live_started, nil, 204)
     mock.events.seek()
     local live_progress = next_request("/Sessions/Playing/Progress")
     assert_equal(command_body(live_progress).LiveStreamId, stream_id, "直播进度上报缺少 LiveStreamId")
+    assert_equal(command_body(live_progress).PlayMethod, remux and "DirectStream" or "DirectPlay",
+        "直播进度上报的播放方式错误")
+    assert_equal(command_body(live_progress).CanSeek, false, "直播进度错误标记为可跳转")
+    assert_equal(command_body(live_progress).PositionTicks, 0, "直播进度错误上报了文件时间轴")
     respond(live_progress, nil, 204)
     return live_load
 end
@@ -862,13 +891,26 @@ local close_one = next_request("/LiveStreams/Close")
 assert_true(command_url(close_one):find("stream-one", 1, true), "停止直播没有关闭正确的媒体源")
 respond(close_one, nil, 204)
 
-start_live("stream-two")
+for _, protocol in ipairs({ "Udp", "Rtp" }) do
+    local stream_id = "multicast-" .. protocol
+    start_live(stream_id, protocol)
+    mock.events["end-file"]({ reason = "stop" })
+    local stopped = next_request("/Sessions/Playing/Stopped")
+    assert_equal(command_body(stopped).PositionTicks, 0, "组播停止位置不是零")
+    assert_equal(command_body(stopped).LiveStreamId, stream_id, "组播停止上报的直播流错误")
+    respond(stopped, nil, 204)
+    local closed = next_request("/LiveStreams/Close")
+    assert_true(command_url(closed):find(stream_id, 1, true), "组播停止没有关闭对应直播源")
+    respond(closed, nil, 204)
+end
+
+start_live("stream-two", "Udp")
 mock.events["end-file"]({ reason = "eof" })
 respond(next_request("/Sessions/Playing/Stopped"), nil, 204)
 local failed_close = next_request("/LiveStreams/Close")
 assert_true(command_url(failed_close):find("stream-two", 1, true), "直播关闭失败用例选错了媒体源")
 respond(failed_close, nil, 500)
-start_live("stream-three")
+start_live("stream-three", "Rtp")
 mock.events.shutdown()
 
 local flushed_stop = false
@@ -941,6 +983,273 @@ input_mock.current = nil
 cancel_menu.closed()
 assert_true(canceled_poll.aborted, "主动关闭快速连接没有中止轮询请求")
 assert_equal(quick_timer.active, false, "主动关闭快速连接没有停止轮询定时器")
+
+-- Each scenario starts a fresh script instance through its public callbacks.
+local current_auth = {
+    version = 3, device_id = "stable-device", server_url = "http://jellyfin.test",
+    user_id = "user", access_token = "token",
+}
+local function boot(saved, settings)
+    auth_content = saved and utils_mock.format_json(saved) or nil
+    for _, name in ipairs({ "async", "commands", "keybindings", "events", "hooks",
+        "observers", "timers", "timeouts", "messages", "osd" }) do mock[name] = {} end
+    mock.properties = { ["mpv-version"] = "mpv 0.39.0", pause = false, mute = false }
+    input_mock.current = nil
+    options_mock.read_options = function(options)
+        options.cache_path = "CACHE"
+        for key, value in pairs(settings or {}) do options[key] = value end
+    end
+    dofile(source_path)
+end
+
+local function authorize()
+    respond(next_request("/QuickConnect/Initiate"), { Code = "123456", Secret = "private-secret" })
+    respond(next_request("/QuickConnect/Connect"), { Authenticated = true })
+    respond(next_request("/Users/AuthenticateWithQuickConnect"), {
+        AccessToken = "token", User = { Id = "user" },
+    })
+    run_timeouts()
+end
+
+boot(nil, { show_by_default = "on", show_on_idle = "on" })
+mock.observers["idle-active"]("idle-active", true)
+local address_input = input_mock.current
+run_timeouts()
+assert_equal(input_mock.current, address_input, "双自动打开选项关闭了地址输入")
+submit_current("http://jellyfin.test")
+local auto_initiate = next_request("/QuickConnect/Initiate")
+mock.observers["idle-active"]("idle-active", true)
+assert_equal(request_count("/QuickConnect/Initiate"), 1, "自动打开重复发起了登录")
+assert_true(not auto_initiate.aborted, "自动打开取消了正在进行的登录")
+
+boot(current_auth, { show_by_default = "on", show_on_idle = "on" })
+mock.observers["idle-active"]("idle-active", true)
+local auto_user = next_request("/Users/user")
+run_timeouts()
+assert_true(not auto_user.aborted, "双自动打开选项关闭了已认证菜单")
+assert_equal(request_count("/Views"), 1, "自动打开重复加载了首页")
+
+boot(nil)
+mock.keybindings.jf()
+local deferred_address = input_mock.current
+deferred_address.submit("http://canceled.test")
+deferred_address.closed()
+mock.keybindings.jf()
+run_timeouts()
+assert_equal(#mock.async, 0, "取消后地址输入的延迟回调仍启动了登录")
+assert_equal(json_values[auth_content].server_url, "", "取消后仍保存了待提交地址")
+
+boot(nil)
+mock.keybindings.jf_search()
+submit_current("remember")
+assert_equal(input_mock.current.id, "jellyfin-server", "首次搜索没有进入地址输入")
+submit_current("  https://server.test:8920/jellyfin///  ")
+assert_equal(command_url(next_request("/QuickConnect/Initiate")),
+    "https://server.test:8920/jellyfin/QuickConnect/Initiate", "端口或反代子路径拼接错误")
+authorize()
+local remembered = next_request("SearchTerm=remember")
+assert_true(command_url(remembered):find("https://server.test:8920/jellyfin/Users/user/Items", 1, true),
+    "授权后的搜索没有使用保存的服务器")
+assert_true(not has_request("/Views"), "授权成功后丢弃查询并打开了首页")
+respond(remembered, nil, 401)
+local reset_auth = json_values[auth_content]
+assert_equal(reset_auth.server_url, "https://server.test:8920/jellyfin", "401 清除了服务器地址")
+local stable_device = reset_auth.device_id
+authorize()
+next_request("SearchTerm=remember")
+assert_equal(json_values[auth_content].device_id, stable_device, "重新认证更换了设备 ID")
+
+boot(nil)
+mock.keybindings.jf_search()
+submit_current("canceled")
+local canceled_address = input_mock.current
+mock.keybindings.jf()
+canceled_address.closed()
+assert_equal(#mock.async, 0, "取消地址输入后发出了请求")
+mock.keybindings.jf()
+submit_current("http://jellyfin.test")
+authorize()
+next_request("/Views")
+assert_true(not has_request("SearchTerm="), "取消登录后仍保留旧搜索")
+
+boot({ version = 3, device_id = "device", server_url = "http://jellyfin.test" })
+mock.keybindings.jf_search()
+submit_current("canceled-code")
+respond(next_request("/QuickConnect/Initiate"), { Code = "123456", Secret = "secret" })
+local canceled_code = input_mock.current
+input_mock.current = nil
+canceled_code.closed()
+mock.keybindings.jf()
+authorize()
+next_request("/Views")
+assert_true(not has_request("SearchTerm="), "关闭验证码后仍保留旧搜索")
+
+for _, status in ipairs({ 404, 401 }) do
+    boot({ version = 3, device_id = "device", server_url = "http://jellyfin.test" })
+    mock.keybindings.jf()
+    respond(next_request("/QuickConnect/Initiate"), { Code = "123456", Secret = "secret" })
+    local poll = next_request("/QuickConnect/Connect")
+    local timer = mock.timers[#mock.timers]
+    respond(poll, nil, status)
+    assert_true(not timer.active, "终止状态没有停止快速连接计时器")
+    assert_equal(input_mock.current, nil, "终止状态没有关闭验证码")
+    timer.callback()
+    assert_equal(request_count("/QuickConnect/Connect"), 1, "失效验证码仍继续轮询")
+    poll.callback(true, { status = 0, stdout = utils_mock.format_json({ Authenticated = true }) .. "\n200" })
+    assert_true(not has_request("/Users/AuthenticateWithQuickConnect"), "过期回调启动了令牌请求")
+    mock.keybindings.jf()
+    next_request("/QuickConnect/Initiate")
+end
+
+boot({ version = 3, device_id = "device", server_url = "http://jellyfin.test" })
+mock.keybindings.jf()
+respond(next_request("/QuickConnect/Initiate"), { Code = "123456", Secret = "private-secret" })
+local network_poll = next_request("/QuickConnect/Connect")
+network_poll.completed = true
+network_poll.callback(true, { status = 35, stderr = "TLS handshake failed" })
+local diagnostic = mock.messages[#mock.messages].text
+assert_true(diagnostic:find("curl 35", 1, true) and diagnostic:find("TLS handshake failed", 1, true),
+    "日志丢失了 curl 状态或标准错误")
+assert_true(not diagnostic:find("private-secret", 1, true), "日志泄露了快速连接 secret")
+local retry_timer = mock.timers[#mock.timers]
+assert_true(retry_timer.active, "暂时网络故障结束了登录")
+retry_timer.callback()
+respond(next_request("/QuickConnect/Connect"), { Authenticated = false })
+assert_true(retry_timer.active, "待授权状态结束了登录")
+retry_timer.callback()
+respond(next_request("/QuickConnect/Connect"), nil, 503)
+assert_true(retry_timer.active, "暂时服务端故障结束了登录")
+retry_timer.callback()
+local launch_failure = next_request("/QuickConnect/Connect")
+launch_failure.completed = true
+launch_failure.callback(false, nil, "failed to launch curl")
+assert_true(mock.messages[#mock.messages].text:find("failed to launch curl", 1, true),
+    "日志丢失了进程启动失败原因")
+
+boot({ version = 3, device_id = "device", server_url = "http://jellyfin.test" })
+mock.keybindings.jf()
+respond(next_request("/QuickConnect/Initiate"), { Code = "123456", Secret = "secret" })
+respond(next_request("/QuickConnect/Connect"), { Authenticated = true })
+respond(next_request("/Users/AuthenticateWithQuickConnect"), { AccessToken = "token", User = { Id = "user" } })
+mock.keybindings.jf()
+run_timeouts()
+assert_true(not has_request("/Views"), "登录成功后已关闭的菜单被延迟回调重新打开")
+
+for _, mode in ipairs({ "complete", "missing", "failed" }) do
+    boot(current_auth)
+    mock.keybindings.jf()
+    respond(next_request("/Users/user"), { Configuration = {} })
+    respond(next_request("/Views"), { Items = {
+        { Id = "tv-one", Name = "TV1", Type = "CollectionFolder", CollectionType = "tvshows" },
+        { Id = "tv-two", Name = "TV2", Type = "CollectionFolder", CollectionType = "tvshows" },
+    } })
+    respond(next_request("ParentId=tv-two"), {
+        { Id = "e3", Name = "fake-b", Type = "Episode", SeriesId = "b" },
+        { Id = "e4", Name = "fake-c", Type = "Episode", SeriesId = "c" },
+    })
+    respond(next_request("ParentId=tv-one"), {
+        { Id = "e1", Name = "fake-a", Type = "Episode", SeriesId = "a" },
+        { Id = "e2", Name = "fake-b", Type = "Episode", SeriesId = "b" },
+        { Id = "e5", Name = "fake-a", Type = "Episode", SeriesId = "a" },
+    })
+    local batch = next_request("Ids=a%2Cb%2Cc")
+    local series = {
+        { Id = "c", Name = "C", Type = "Series", RecursiveItemCount = 10,
+            ChildCount = 2, UserData = { UnplayedItemCount = 3 } },
+        { Id = "a", Name = "A", Type = "Series", UserData = { Played = false } },
+    }
+    if mode == "complete" then
+        series[#series + 1] = { Id = "b", Name = "B", Type = "Series", UserData = { Played = true } }
+    end
+    if mode == "failed" then respond(batch, nil, 500) else respond(batch, { Items = series }) end
+    assert_equal(request_count("Ids="), 1, "系列信息没有合并成一次查询")
+    local expected = mode == "complete" and { "媒体库 · TV1", "🔲 A", "✅ B", "媒体库 · TV2", "✅ B", "🔄 C" }
+        or mode == "missing" and { "媒体库 · TV1", "🔲 A", "媒体库 · TV2", "🔄 C" }
+        or { "媒体库 · TV1", "媒体库 · TV2" }
+    assert_equal(#input_mock.current.items, #expected, "首页生成了多余的系列项目")
+    for index, label in ipairs(expected) do
+        assert_equal(input_mock.current.items[index], label, "首页顺序或真实观看状态错误")
+    end
+end
+
+boot(current_auth)
+submit_search("episodes", { { Id = "series", Name = "Series", Type = "Series" } })
+submit_current(find_label(input_mock.current.items, "🔲 Series"))
+local episode_request = next_request("ParentId=series")
+assert_true(command_url(episode_request):find("DateCreated", 1, true), "剧集排序没有请求入库时间")
+assert_true(not command_url(episode_request):find("Limit=", 1, true), "剧集连播列表被分页截断")
+respond(episode_request, { Items = {
+    { Id = "ep4", Name = "four", Type = "Episode", ParentIndexNumber = 1, IndexNumber = 4,
+        DateCreated = "2026-01-04", UserData = { Played = true } },
+    { Id = "ep2", Name = "two", Type = "Episode", ParentIndexNumber = 1, IndexNumber = 2,
+        DateCreated = "2026-01-02" },
+    { Id = "ep3", Name = "three", Type = "Episode", ParentIndexNumber = 1, IndexNumber = 3,
+        DateCreated = "2026-01-03", UserData = { Played = true } },
+    { Id = "ep1", Name = "one", Type = "Episode", ParentIndexNumber = 1, IndexNumber = 1,
+        DateCreated = "2026-02-01" },
+} })
+local episode_labels = input_mock.current.items
+for index, name in ipairs({ "one", "two", "four", "three" }) do
+    assert_true(episode_labels[index + 1]:find(name, 1, true), "剧集展示未遵循入库时间及观看状态")
+end
+submit_current(3)
+local queued_ids = {}
+for _, command in ipairs(mock.commands) do
+    if command[1] == "loadfile" then queued_ids[#queued_ids + 1] = command[2]:match("/Videos/([^/]+)/") end
+end
+assert_equal(table.concat(queued_ids, ","), "ep2,ep3,ep4", "连播队列错误沿用了展示排序")
+
+local function open_live_without_loading(id, protocol)
+    submit_search(id, { { Id = id, Name = id, Type = "LiveTvChannel" } })
+    submit_current(find_label(input_mock.current.items, id))
+    respond(next_request("/Items/" .. id .. "/PlaybackInfo"), {
+        PlaySessionId = "session-" .. id,
+        MediaSources = { { Id = "source-" .. id, LiveStreamId = "stream-" .. id,
+            Protocol = protocol or "Http", SupportsDirectPlay = true } },
+    })
+    return last_loadfile()[2]
+end
+
+boot(current_auth)
+mock.properties.path = open_live_without_loading("one", "Udp")
+open_live_without_loading("two", "Rtp")
+local pending_close = next_request("/LiveStreams/Close")
+assert_true(command_url(pending_close):find("stream-one", 1, true), "加载中切台没有关闭旧流")
+mock.events["end-file"]({ reason = "stop" })
+assert_equal(request_count("/LiveStreams/Close"), 1, "旧流停止事件重复关闭了直播源")
+respond(pending_close, nil, 204)
+mock.events.shutdown()
+local shutdown_closed_two = false
+for _, command in ipairs(mock.commands) do
+    if command.name == "subprocess" and command_url(command):find("liveStreamId=stream-two", 1, true) then
+        shutdown_closed_two = true
+    end
+end
+assert_true(shutdown_closed_two, "退出没有关闭仍在加载的新流")
+
+boot(current_auth)
+mock.properties.path = open_live_without_loading("started", "Udp")
+mock.events["file-loaded"]()
+respond(next_request("/Sessions/Playing"), nil, 204)
+mock.events["end-file"]({ reason = "stop" })
+local awaiting_stop = next_request("/Sessions/Playing/Stopped")
+open_live_without_loading("next", "Rtp")
+assert_equal(request_count("/LiveStreams/Close"), 0, "旧流在停止上报完成前被关闭")
+respond(awaiting_stop, nil, 204)
+assert_true(command_url(next_request("/LiveStreams/Close")):find("stream-started", 1, true),
+    "停止上报完成后没有关闭旧流")
+
+for _, protocol in ipairs({ "Http", "Udp", "Rtp" }) do
+    boot(current_auth)
+    mock.properties.path = open_live_without_loading("failed", protocol)
+    mock.events["end-file"]({ reason = "error" })
+    assert_equal(request_count("/Sessions/Playing"), 0, "加载失败不应上报已开始播放")
+    local closed = next_request("/LiveStreams/Close")
+    assert_true(command_url(closed):find("stream-failed", 1, true), "加载失败没有关闭直播源")
+    respond(closed, nil, 204)
+    mock.events["end-file"]({ reason = "error" })
+    assert_equal(request_count("/LiveStreams/Close"), 1, "加载失败重复关闭了直播源")
+end
 
 mock.properties["mpv-version"] = "mpv 0.38.0"
 mock.keybindings = {}
